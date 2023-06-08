@@ -1,0 +1,1597 @@
+#include <stdio.h>
+#include <string.h>
+#include <signal.h>
+#include <time.h>
+#include <mysql/mysql.h>
+#include <unistd.h>
+#include "open62541.h"
+#include "itri_injpro.h"
+#include "config.h"
+#include "config_opcua.h"
+
+int intIMMSN = 0;
+int intMOSN = 0;
+int intShotSN = 0;
+int intSubscribeIMMPID = 0;
+int intOPCUAVersionSN = 0;
+int intIMMParaSN = 0;
+int intCountAcceptCriteriaSN = 0;
+int intExpectedProductVolume = 0;
+int *intMOAcceptCriteriaSNTHFlag;
+double *doubleMOAcceptCriteriaSNTH;
+bool boolIsStopSignal = false;
+bool boolHasMoldReleased = false;
+bool boolIsMoldClamped = false;
+bool boolHasMoldClamped = false;
+bool boolHasIMMParaChanged = false;
+int intMonIDNodeIndex[OPCUA_IMMPARA_NODE_NUM] = {0};
+char charMonIDNodeIndex[OPCUA_IMMPARA_NODE_NUM][SMALL_STRING_SIZE];
+char charOPCUAIMMSensorNodeList[OPCUA_IMMSENSOR_NODE_NUM + 1][OPCUA_META_NUM][MEDIUM_STRING_SIZE];
+double doubleOPCUAConvertRatio[OPCUA_IMMPARA_NODE_NUM + OPCUA_IMMSENSOR_NODE_NUM + 1] = {0};
+
+static void handler_StopSubscribeIMM(int intSign)
+{
+	boolIsStopSignal = true;
+}
+static void
+subscriptionInactivityCallback(UA_Client *client, UA_UInt32 subId, void *subContext)
+{
+	fprintf(stderr, "[SubscribeIMM]IMMSN:%d Inactivity for subscription %u", intIMMSN, subId);
+}
+
+static void inactivityCallback(UA_Client *client)
+{
+	fprintf(stderr, "[SubscribeIMM]IMMSN:%d Server Inactivity", intIMMSN);
+}
+int OPCUA_GetElapsedTime(struct timespec stStartTimeStamp, double *doubleElapsedTime);
+int OPCUA_InsertIMMSensor(MYSQL mysqlCon, UA_Client *client, int intShotSN);
+int DB_InsertPreviousIMMPara(MYSQL mysqlCon);
+static void handler_IMMChanged(UA_Client *client, UA_UInt32 subId, void *subContext, UA_UInt32 monId, void *monContext, UA_DataValue *value);
+int OPCUA_SubscribeIMM(UA_Client *client, MYSQL mysqlCon);
+
+static void stateCallback(UA_Client *client, UA_ClientState clientState);
+
+int main(int argc, char *argv[])
+{
+	char charOPCUAIP[16];
+	unsigned int intOPCUAPort;
+	unsigned int intIMMModelSN;
+	unsigned int intUserID;
+	int intRetval;
+	char charEndPointURL[MEDIUM_STRING_SIZE] = {'\0'};
+	char charStatement[MAX_STRING_SIZE];
+	char charErrMsg[LONG_STRING_SIZE];
+	char charTableName[MEDIUM_STRING_SIZE];
+	char *charShotSN;
+	char *charIMMParaSN;
+	bool boolHasInsertErrMsg = false;
+	MYSQL mysqlCon;
+	struct timespec stConnectTimeStamp;
+	double doubleConnectElapsedTime;
+
+	signal(SIGINT, handler_StopSubscribeIMM);
+	signal(SIGTERM, handler_StopSubscribeIMM);
+
+	//Connect to MYSQL Server
+	mysql_init(&mysqlCon);
+	if (!mysql_real_connect(&mysqlCon, MYSQL_SERVER_IP, MYSQL_USER_NAME, MYSQL_PASSWORD, NULL, 0, NULL, CLIENT_FOUND_ROWS))
+	{
+		fprintf(stderr, "MYSQL connection failed.\n");
+		if (mysql_errno(&mysqlCon))
+		{
+			fprintf(stderr, "MYSQL connection error %d: %s\n", mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+		}
+		return EXIT_FAILURE;
+	}
+
+	//Get IMMSN from Parameters
+	if (argc == 3 && strcmp(argv[1], "-IMMSN") == 0)
+	{
+		intIMMSN = atoi(argv[2]);
+	}
+	else
+	{
+		snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Fail to subscribe IMM due to parameter format error");
+		SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, 0, intIMMSN, EXIT_FAILURE, charErrMsg);
+		return EXIT_FAILURE;
+	}
+
+	//Select IMM Model, MOSN andOPCUA Information According to The Given IMMSN
+	snprintf(charStatement, MAX_STRING_SIZE, "SELECT IMMModelSN,MOSN,OPCUAVersionSN,OPCUAIP,OPCUAPort,SubscribeIMMPID,ShotSN FROM %s_%s.IMMList WHERE IMMSN=%d", SYS_NAME, DATA_DATABASE_NAME, intIMMSN);
+	intRetval = mysql_query(&mysqlCon, charStatement);
+	if (intRetval)
+	{
+		snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Fail to select information where IMMSN=%d from %s_%s.IMMList (%d):%s",
+				 intIMMSN, SYS_NAME, DATA_DATABASE_NAME, mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+		SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, 0, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+		return EXIT_FAILURE;
+	}
+
+	MYSQL_RES *mysqlResult = mysql_store_result(&mysqlCon);
+	MYSQL_ROW mysqlRow = mysql_fetch_row(mysqlResult);
+	if (mysqlRow == NULL)
+	{
+		snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Fail to subscribe IMM parameter due to IMMSN=%d is not found in %s_%s.IMMList",
+				 intIMMSN, SYS_NAME, DATA_DATABASE_NAME);
+		SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, 0, charErrMsg);
+		return EXIT_FAILURE;
+	}
+
+	//Get IMMModelSN
+	if (mysqlRow[0] == NULL)
+	{
+		snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Fail to select IMMModelSN of IMMSN:%d", intIMMSN);
+		SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, 0, intIMMSN, EXIT_FAILURE, charErrMsg);
+		return EXIT_FAILURE;
+	}
+	else
+		intIMMModelSN = atoi(mysqlRow[0]);
+
+	//Get MOSN
+	if (mysqlRow[1] == NULL)
+	{
+		snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Fail to select MOSN for IMMSN:%d", intIMMSN);
+		SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, 0, intIMMSN, EXIT_FAILURE, charErrMsg);
+		return EXIT_FAILURE;
+	}
+	else
+		intMOSN = atoi(mysqlRow[1]);
+
+	//Get OPCUAVersionSN
+	if (mysqlRow[2] == NULL)
+	{
+		snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Fail to select OPCUAVersionSN for IMMSN:%d", intIMMSN);
+		SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, EXIT_FAILURE, charErrMsg);
+		return EXIT_FAILURE;
+	}
+	else
+		intOPCUAVersionSN = atoi(mysqlRow[2]);
+
+	//Get OPC UA IP
+	if (mysqlRow[3] == NULL)
+	{
+		snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Fail to select OPCUA IP of IMMSN:%d", intIMMSN);
+		SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, EXIT_FAILURE, charErrMsg);
+		return EXIT_FAILURE;
+	}
+	else
+		strcpy(charOPCUAIP, mysqlRow[3]);
+
+	//Get OPC UA Port
+	if (mysqlRow[4] == NULL)
+	{
+		snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Fail to select OPC UA Port of IMMSN:%d", intIMMSN);
+		SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, EXIT_FAILURE, charErrMsg);
+		return EXIT_FAILURE;
+	}
+	else
+		intOPCUAPort = atoi(mysqlRow[4]);
+
+	boolHasInsertErrMsg = false;
+	//Get Subscribe Procress ID
+	if (mysqlRow[5] != NULL)
+	{
+		intSubscribeIMMPID = atoi(mysqlRow[5]);
+
+		//Notify An Existing Subscribe Porcess Is Executing
+		snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]A subscribe process PID:%d of IMMSN:%d is executing", intSubscribeIMMPID, intIMMSN);
+		SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, EXIT_FAILURE, charErrMsg);
+
+		//Kill the Subscribe Procress
+		intRetval = kill(intSubscribeIMMPID, SIGTERM);
+		if (intRetval != EXIT_SUCCESS)
+		{
+			snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Fail to kill subscribe process PID:%d of IMMSN:%d.", intSubscribeIMMPID, intIMMSN);
+			SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+
+			snprintf(charStatement, MAX_STRING_SIZE, "UPDATE %s_%s.IMMList SET SubscribeIMMPID=NULL WHERE IMMSN=%d",
+					 SYS_NAME, DATA_DATABASE_NAME, intIMMSN);
+			intRetval = mysql_query(&mysqlCon, charStatement);
+			if (intRetval)
+			{
+				snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Fail to Update SubscribeIMMPID=NULL for IMMSN=%d while terminating (%d):%s",
+						 intIMMSN, mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+				SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+				return EXIT_FAILURE;
+			}
+		}
+		else
+		{
+			snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]The subscribe process PID:%d of IMMSN:%d is terminated", intSubscribeIMMPID, intIMMSN);
+			SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+		}
+
+		//Get timestamp before connect to OPC UA server
+		clock_gettime(CLOCK_REALTIME, &stConnectTimeStamp);
+
+		//Wait For The SubscribeIMMPID = NULL
+		do
+		{
+			snprintf(charStatement, MAX_STRING_SIZE, "SELECT SubscribeIMMPID FROM %s_%s.IMMList WHERE IMMSN=%d",
+					 SYS_NAME, DATA_DATABASE_NAME, intIMMSN);
+			intRetval = mysql_query(&mysqlCon, charStatement);
+			if (intRetval && boolHasInsertErrMsg == false)
+			{
+				snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Fail to select SubscribeIMMPID for IMMSN=%d while exiting (%d):%s",
+						 intIMMSN, mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+				SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+				boolHasInsertErrMsg = true;
+			}
+			mysqlResult = mysql_store_result(&mysqlCon);
+			mysqlRow = mysql_fetch_row(mysqlResult);
+			sleep(1);
+			OPCUA_GetElapsedTime(stConnectTimeStamp, &doubleConnectElapsedTime);
+
+			if (doubleConnectElapsedTime > UA_CLIENT_TIME_OUT_SEC)
+			{
+				snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Subscribtion terminated. Fail to kill subscribe process PID:%d of IMMSN:%d",
+						 intSubscribeIMMPID, intIMMSN);
+				SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+
+				//Close MySQL Connection
+				mysql_close(&mysqlCon);
+				return EXIT_FAILURE;
+			}
+		} while (mysqlRow[0] != NULL);
+	}
+	mysql_free_result(mysqlResult);
+
+	//Select MO Meta Information from INJPRO_Data_MO.MOList
+	snprintf(charStatement, MAX_STRING_SIZE, "SELECT ExpectedProdouctVolume FROM %s_%s_%s.MOList",
+			 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME);
+	intRetval = mysql_query(&mysqlCon, charStatement);
+	if (intRetval)
+	{
+		snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Fail to select MO meta information from %s_%s_%s.MOList (%d):%s",
+				 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+		SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+		return EXIT_FAILURE;
+	}
+	mysqlResult = mysql_store_result(&mysqlCon);
+	mysqlRow = mysql_fetch_row(mysqlResult);
+	intExpectedProductVolume = atoi(mysqlRow[0]);
+	mysql_free_result(mysqlResult);
+
+	//Select MAX AcceptCriteriaSN from INJPRO_Data_MO_[MOSN]_Info_Meta.MOAcceptCriteriaSNList
+	snprintf(charStatement, MAX_STRING_SIZE,
+			 "SELECT MOAcceptCriteriaSN,MOAcceptCriteriaClass,MOAcceptCriteriaMinTH,MOAcceptCriteriaMaxTH FROM %s_%s_%s_%d_Info_Meta.MOAcceptCriteriaSNList", SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN);
+	intRetval = mysql_query(&mysqlCon, charStatement);
+	if (intRetval)
+	{
+		snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Fail to select information from %s_%s_MO_%d_Info_Meta.MOAcceptCriteriaSNList (%d):%s",
+				 SYS_NAME, DATA_DATABASE_NAME, intMOSN, mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+		SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+		return EXIT_FAILURE;
+	}
+	mysqlResult = mysql_store_result(&mysqlCon);
+	intCountAcceptCriteriaSN = mysql_num_rows(mysqlResult);
+
+	/*
+		intMOAcceptCriteriaSNTHFlag[N*4] where N=intCountAcceptCriteriaSN
+		intMOAcceptCriteriaSNTHFlag[N]=MOAcceptCriteriaSN
+		intMOAcceptCriteriaSNTHFlag[N+1]=AcceptCriteriaClass
+		intMOAcceptCriteriaSNTHFlag[N+2]=Min threshold is not null
+		intMOAcceptCriteriaSNTHFlag[N+3]=Max threshold is not null
+
+	*/
+
+	intMOAcceptCriteriaSNTHFlag = (int *)malloc(intCountAcceptCriteriaSN * ACCEPTCRATERIA_META_NUM * sizeof(int));
+	doubleMOAcceptCriteriaSNTH = (double *)malloc(intCountAcceptCriteriaSN * 2 * sizeof(double));
+	for (int i = 0; mysqlRow = mysql_fetch_row(mysqlResult); i++)
+	{
+
+		//Initialization
+		*(intMOAcceptCriteriaSNTHFlag + i * ACCEPTCRATERIA_META_NUM + ACCEPTCRATERIA_META_SN) = atoi(mysqlRow[0]);
+		*(intMOAcceptCriteriaSNTHFlag + i * ACCEPTCRATERIA_META_NUM + ACCEPTCRATERIA_META_CLASS) = atoi(mysqlRow[1]);
+		*(intMOAcceptCriteriaSNTHFlag + i * ACCEPTCRATERIA_META_NUM + ACCEPTCRATERIA_META_HASMIN) = false;
+		*(intMOAcceptCriteriaSNTHFlag + i * ACCEPTCRATERIA_META_NUM + ACCEPTCRATERIA_META_HASMAX) = false;
+
+		//If AcceptCriteriaMinTH!=NULL
+		if (mysqlRow[2] != NULL)
+		{
+			*(intMOAcceptCriteriaSNTHFlag + i * ACCEPTCRATERIA_META_NUM + ACCEPTCRATERIA_META_HASMIN) = true;
+			*(doubleMOAcceptCriteriaSNTH + i * 2) = (double)atof(mysqlRow[2]);
+
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+			fprintf(stderr, "[SubscribeIMM]MOSN:%d MOAcceptCrateriaSN:%d has min threshold:%lf\n",
+					intMOSN, atoi(mysqlRow[0]), (double)atof(mysqlRow[2]));
+#endif
+		}
+
+		//If AcceptCriteriaMaxTH!=NULL
+		if (mysqlRow[3] != NULL)
+		{
+			*(intMOAcceptCriteriaSNTHFlag + i * ACCEPTCRATERIA_META_NUM + ACCEPTCRATERIA_META_HASMAX) = true;
+			*(doubleMOAcceptCriteriaSNTH + i * 2 + 1) = (double)atof(mysqlRow[3]);
+
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+			fprintf(stderr, "[SubscribeIMM]MOSN:%d MOAcceptCrateriaSN:%d has max threshold:%lf\n",
+					intMOSN, atoi(mysqlRow[0]), (double)atof(mysqlRow[3]));
+#endif
+		}
+	}
+	mysqlRow = mysql_fetch_row(mysqlResult);
+	mysql_free_result(mysqlResult);
+
+	//Update SubscribeIMMPID and IMMLastUpdateTime to INJPRO_Data.IMMList
+	snprintf(charStatement, MAX_STRING_SIZE, "UPDATE %s_%s.IMMList SET SubscribeIMMPID=%d,IMMLastUpdateTime=NOW(6) WHERE IMMSN=%d",
+			 SYS_NAME, DATA_DATABASE_NAME, getpid(), intIMMSN);
+	intRetval = mysql_query(&mysqlCon, charStatement);
+	if (intRetval)
+	{
+		snprintf(charErrMsg, LONG_STRING_SIZE,
+				 "Fail to update SubscribeIMMPID=getpid() and IMMLastUpdateTime=NOW(6) where IMMSN=%d (%d):%s",
+				 intIMMSN, mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+		SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+		return EXIT_FAILURE;
+	}
+
+	//Select ShotSN From INJPRO_DATA_MO_[MOSN]_RawData.ShotSNList
+	snprintf(charTableName, MEDIUM_STRING_SIZE, "%s_%s_%s_%d_RawData.ShotSNList",
+			 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN);
+	intRetval = DB_SelectColumnMax(mysqlCon, charTableName, "ShotSN", &charShotSN);
+	if (intRetval == EXIT_FAILURE)
+		return EXIT_FAILURE;
+	intShotSN = atoi(charShotSN) + 1;
+	if (intShotSN != 1)
+	{
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+		fprintf(stderr, "[SubscribeIMM]IMMSN:%d resumes the MOSN:%d from ShotSN:%d\n", intIMMSN, intMOSN, intShotSN);
+#endif
+	}
+
+	//Update ShotSN to INJPRO_Data.IMMList
+	snprintf(charStatement, MAX_STRING_SIZE, "UPDATE %s_%s.IMMList SET ShotSN=%d WHERE IMMSN=%d",
+			 SYS_NAME, DATA_DATABASE_NAME, intShotSN, intIMMSN);
+	intRetval = mysql_query(&mysqlCon, charStatement);
+	if (intRetval)
+	{
+		snprintf(charErrMsg, LONG_STRING_SIZE,
+				 "Fail to update ShotSN:%d to %s_%s.IMMList where IMMSN:%d (%d): %s",
+				 intShotSN, SYS_NAME, DATA_DATABASE_NAME, intIMMSN,
+				 mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+		SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+		return EXIT_FAILURE;
+	}
+
+	//Select MAX IMMParaSN in INJPRO_DATA_MO_[MOSN]_RawData_IMMPara.IMMParaSNList
+	snprintf(charStatement, MAX_STRING_SIZE, "%s_%s_%s_%d_RawData_IMMPara.IMMParaSNList",
+			 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN);
+	intRetval = DB_SelectColumnMax(mysqlCon, charStatement, "IMMParaSN", &charIMMParaSN);
+	//New the next IMM parameter
+	intIMMParaSN = atoi(charIMMParaSN) + 1;
+
+	//Close MySQL Connection
+	mysql_close(&mysqlCon);
+
+	if (intRetval == EXIT_FAILURE)
+		return EXIT_FAILURE;
+
+	//Set Convert ratio
+	intRetval = OPCUA_ConvertRatioInit(doubleOPCUAConvertRatio);
+	UA_ClientConfig config = UA_ClientConfig_default;
+	config.stateCallback = stateCallback;
+	config.subscriptionInactivityCallback = subscriptionInactivityCallback;
+	UA_Client *client = UA_Client_new(config);
+
+	//Get timestamp before connect to OPC UA server
+	//clock_gettime(CLOCK_REALTIME, &stConnectTimeStamp);
+
+	snprintf(charEndPointURL, MEDIUM_STRING_SIZE, "opc.tcp://%s:%d", charOPCUAIP, intOPCUAPort);
+	//while(boolIsStopSignal==false || (intRetval!=UA_STATUSCODE_GOOD &&doubleConnectElapsedTime<UA_CLIENT_TIME_OUT_SEC)){
+	while (boolIsStopSignal == false)
+	{
+		//fprintf(stderr,"[SubscribeIMM]Connect to %s...\n",charEndPointURL);
+		//fprintf(stderr,"[SubscribeIMM]Connectstate=%d\n",UA_Client_getState(client));
+
+		intRetval = UA_Client_connect(client, charEndPointURL);
+		if (intRetval != UA_STATUSCODE_GOOD)
+		{
+
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+			fprintf(stderr, "[SubscribeIMM]Fail to connect to %s. Retrying to connect in %d ms\n", charEndPointURL, UA_CLIENT_INTERVAL);
+#endif
+			if (boolHasInsertErrMsg == false)
+			{
+
+				//Get timestamp before reconnect to OPC UA server
+				clock_gettime(CLOCK_REALTIME, &stConnectTimeStamp);
+
+				//Connect to MYSQL Server
+				mysql_init(&mysqlCon);
+				if (!mysql_real_connect(&mysqlCon, MYSQL_SERVER_IP, MYSQL_USER_NAME, MYSQL_PASSWORD, NULL, 0, NULL, CLIENT_FOUND_ROWS))
+				{
+					fprintf(stderr, "MYSQL connection failed.\n");
+					if (mysql_errno(&mysqlCon))
+					{
+						fprintf(stderr, "MYSQL connection error %d: %s\n", mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+					}
+					return EXIT_FAILURE;
+				}
+
+				//Insert error message
+				snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Fail to subscribe IMM:%d due to OPC UA connection fail", intIMMSN);
+				SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_OPCUA_CLIENT, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+				boolHasInsertErrMsg = true;
+
+				//Close MySQL Connection
+				mysql_close(&mysqlCon);
+			}
+		}
+		else
+			boolHasInsertErrMsg = false;
+
+		UA_Client_runAsync(client, UA_CLIENT_INTERVAL);
+
+		//Get Elapsed Time of Connection
+		OPCUA_GetElapsedTime(stConnectTimeStamp, &doubleConnectElapsedTime);
+		//fprintf(stderr,"Already wait %lf secs\n",doubleConnectElapsedTime);
+	}
+
+	//Connect to MYSQL Server
+	mysql_init(&mysqlCon);
+	if (!mysql_real_connect(&mysqlCon, MYSQL_SERVER_IP, MYSQL_USER_NAME, MYSQL_PASSWORD, NULL, 0, NULL, CLIENT_FOUND_ROWS))
+	{
+		fprintf(stderr, "MYSQL connection failed..\n");
+		if (mysql_errno(&mysqlCon))
+		{
+			fprintf(stderr, "MYSQL connection error %d: %s\n", mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+		}
+		return EXIT_FAILURE;
+	}
+
+	//Get Current SubscribeIMMPID
+	snprintf(charStatement, MAX_STRING_SIZE, "SELECT SubscribeIMMPID FROM %s_%s.IMMList WHERE IMMSN=%d",
+			 SYS_NAME, DATA_DATABASE_NAME, intIMMSN);
+	intRetval = mysql_query(&mysqlCon, charStatement);
+	if (intRetval)
+	{
+		snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Fail to select SubscribeIMMPID for IMMSN=%d while exiting (%d):%s",
+				 intIMMSN, mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+		SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+	}
+
+	mysqlResult = mysql_store_result(&mysqlCon);
+	mysqlRow = mysql_fetch_row(mysqlResult);
+
+	//Check Current SubscribeIMMPID == getpid()
+	if (mysqlRow[0] != NULL && atoi(mysqlRow[0]) == getpid())
+	{
+
+		//Set SubscribeIMMPID=NULL before exit
+		snprintf(charStatement, MAX_STRING_SIZE, "UPDATE %s_%s.IMMList SET SubscribeIMMPID=NULL, IMMLastUpdateTime=NOW(6) WHERE IMMSN=%d",
+				 SYS_NAME, DATA_DATABASE_NAME, intIMMSN);
+		intRetval = mysql_query(&mysqlCon, charStatement);
+		if (intRetval)
+		{
+			snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Fail to update SubscribeIMMPID and IMMLastUpdateTime for IMMSN=%d (%d):%s",
+					 intIMMSN, mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+			SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+		}
+	}
+
+	//Free mysqlResult
+	mysql_free_result(mysqlResult);
+
+	//Close MySQL Connection
+	mysql_close(&mysqlCon);
+
+	fprintf(stderr, "[SubscribeIMM]SubscribeIMMPID=%d Terminated.\n", getpid());
+	return EXIT_SUCCESS;
+}
+
+int OPCUA_GetElapsedTime(struct timespec stStartTimeStamp, double *doubleElapsedTime)
+{
+	struct timespec stDiffElapsedTime;
+	struct timespec stCurrentTimeStamp;
+
+	clock_gettime(CLOCK_REALTIME, &stCurrentTimeStamp);
+	if (stCurrentTimeStamp.tv_nsec - stStartTimeStamp.tv_nsec < 0)
+	{
+		stDiffElapsedTime.tv_sec = stCurrentTimeStamp.tv_sec - stStartTimeStamp.tv_sec - 1;
+		stDiffElapsedTime.tv_nsec = stCurrentTimeStamp.tv_nsec - stStartTimeStamp.tv_nsec + 1000000000;
+	}
+	else
+	{
+		stDiffElapsedTime.tv_sec = stCurrentTimeStamp.tv_sec - stStartTimeStamp.tv_sec;
+		stDiffElapsedTime.tv_nsec = stCurrentTimeStamp.tv_nsec - stStartTimeStamp.tv_nsec;
+	}
+	*doubleElapsedTime = stDiffElapsedTime.tv_sec + stDiffElapsedTime.tv_nsec / 1000000000.0;
+
+	return EXIT_SUCCESS;
+}
+
+int OPCUA_InsertIMMSensor(MYSQL mysqlCon, UA_Client *client, int intShotSN)
+{
+	char charStatement[MAX_STRING_SIZE];
+	char charErrMsg[LONG_STRING_SIZE];
+	int intRetval;
+	char charIMMSensorValue[OPCUA_IMMSENSOR_NODE_NUM][TINY_STRING_SIZE];
+
+	for (int i = OPCUA_IMMPARA_NODE_NUM + 1; i <= OPCUA_IMMSENSOR_NODE_NUM + OPCUA_IMMPARA_NODE_NUM; i++)
+	{
+		if (charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NS] != NULL)
+		{
+
+			/*
+			fprintf(stderr,"[SubscribeIMM]%s-%s-%s-%s\n",
+			 charOPCUAIMMSensorNodeList[i-OPCUA_IMMPARA_NODE_NUM-1][OPCUA_META_NAME],
+			 charOPCUAIMMSensorNodeList[i-OPCUA_IMMPARA_NODE_NUM-1][OPCUA_META_IDENTIFIER_TYPE],
+			 charOPCUAIMMSensorNodeList[i-OPCUA_IMMPARA_NODE_NUM-1][OPCUA_META_NS],
+			 charOPCUAIMMSensorNodeList[i-OPCUA_IMMPARA_NODE_NUM-1][OPCUA_META_ID]);
+			*/
+
+			snprintf(charIMMSensorValue[i - OPCUA_IMMPARA_NODE_NUM - 1], TINY_STRING_SIZE, "%s", "NULL");
+
+			UA_Variant *readVariant = UA_Variant_new();
+			UA_Variant *convertedVariant = UA_Variant_new();
+
+			if (strcmp(charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_IDENTIFIER_TYPE], "i") == 0)
+			{
+				intRetval = UA_Client_readValueAttribute(client,
+														 UA_NODEID_NUMERIC(atoi(charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NS]),
+																		   atoi(charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_ID])),
+														 readVariant);
+			}
+			else if (strcmp(charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_IDENTIFIER_TYPE], "s") == 0)
+			{
+				intRetval = UA_Client_readValueAttribute(client,
+														 UA_NODEID_STRING(atoi(charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NS]),
+																		  charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_ID]),
+														 readVariant);
+			}
+
+			if (intRetval == UA_STATUSCODE_GOOD && UA_Variant_isScalar(readVariant))
+			{
+				if (readVariant->type == &UA_TYPES[UA_TYPES_BOOLEAN])
+				{
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+					printf("[OPCUA_InsertIMMSensor]Type:Boolean IMMSN:%d IMM Sensor[NS:%2s ID:%-60s Name:%-30s]:%d\n", intIMMSN,
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NS],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_ID],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NAME],
+						   *(UA_Boolean *)readVariant->data);
+#endif
+					snprintf(charIMMSensorValue[i - OPCUA_IMMPARA_NODE_NUM - 1], TINY_STRING_SIZE, "'%d'", *(UA_Boolean *)readVariant->data);
+				}
+				else if (readVariant->type == &UA_TYPES[UA_TYPES_FLOAT])
+				{
+					OPCUA_ConvertOPCUAtoPanel(doubleOPCUAConvertRatio, i, readVariant, convertedVariant);
+					*(UA_Float *)readVariant->data = (int)(*(UA_Float *)readVariant->data * 10000 + 0.5) / 10000;
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+					printf("[OPCUA_InsertIMMSensor]Type:Float IMMSN:%d IMM Sensor[NS:%2s ID:%-60s Name:%-30s]:%f\n", intIMMSN,
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NS],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_ID],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NAME],
+						   *(UA_Float *)readVariant->data);
+					// *(UA_Float*)readVariant->data);
+#endif
+					snprintf(charIMMSensorValue[i - OPCUA_IMMPARA_NODE_NUM - 1], TINY_STRING_SIZE, "'%f'", *(UA_Float *)readVariant->data);
+				}
+				else if (readVariant->type == &UA_TYPES[UA_TYPES_DOUBLE])
+				{
+					OPCUA_ConvertOPCUAtoPanel(doubleOPCUAConvertRatio, i, readVariant, convertedVariant);
+					*(UA_Double *)readVariant->data = (int)(*(UA_Double *)readVariant->data * 10000 + 0.5) / 10000;
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+					printf("[OPCUA_InsertIMMSensor]Type:Double IMMSN:%d IMM Sensor[NS:%2s ID:%-60s Name:%-30s]:%f\n", intIMMSN,
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NS],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_ID],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NAME],
+						   *(UA_Double *)readVariant->data);
+					// *(UA_Double*)readVariant->data);
+#endif
+					snprintf(charIMMSensorValue[i - OPCUA_IMMPARA_NODE_NUM - 1], TINY_STRING_SIZE, "'%f'", *(UA_Double *)readVariant->data);
+				}
+				else if (readVariant->type == &UA_TYPES[UA_TYPES_INT16])
+				{
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+					printf("[OPCUA_InsertIMMSensor]Type:Int16 IMMSN:%d IMM Sensor[NS:%2s ID:%-60s Name:%-30s]:%d\n", intIMMSN,
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NS],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_ID],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NAME],
+						   *(UA_Int16 *)readVariant->data);
+#endif
+					snprintf(charIMMSensorValue[i - OPCUA_IMMPARA_NODE_NUM - 1], TINY_STRING_SIZE, "'%d'", *(UA_Int16 *)readVariant->data);
+				}
+				else if (readVariant->type == &UA_TYPES[UA_TYPES_UINT16])
+				{
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+					printf("[OPCUA_InsertIMMSensor]Type:UInt16 IMMSN:%d IMM Sensor[NS:%2s ID:%-60s Name:%-30s]:%d\n", intIMMSN,
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NS],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_ID],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NAME],
+						   *(UA_UInt16 *)readVariant->data);
+#endif
+					snprintf(charIMMSensorValue[i - OPCUA_IMMPARA_NODE_NUM - 1], TINY_STRING_SIZE, "'%d'", *(UA_UInt16 *)readVariant->data);
+				}
+				else if (readVariant->type == &UA_TYPES[UA_TYPES_INT32])
+				{
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+					printf("[OPCUA_InsertIMMSensor]Type:Int32 IMMSN:%d IMM Sensor[NS:%2s ID:%-60s Name:%-30s]:%d\n", intIMMSN,
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NS],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_ID],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NAME],
+						   *(UA_Int32 *)readVariant->data);
+#endif
+					snprintf(charIMMSensorValue[i - OPCUA_IMMPARA_NODE_NUM - 1], TINY_STRING_SIZE, "'%d'", *(UA_Int32 *)readVariant->data);
+				}
+				else if (readVariant->type == &UA_TYPES[UA_TYPES_UINT32])
+				{
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+					printf("[OPCUA_InsertIMMSensor]Type:UInt32 IMMSN:%d IMM Sensor[NS:%2s ID:%-60s Name:%-30s]:%d\n", intIMMSN,
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NS],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_ID],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NAME],
+						   *(UA_UInt32 *)readVariant->data);
+#endif
+					snprintf(charIMMSensorValue[i - OPCUA_IMMPARA_NODE_NUM - 1], TINY_STRING_SIZE, "%d", *(UA_UInt32 *)readVariant->data);
+				}
+				else if (readVariant->type == &UA_TYPES[UA_TYPES_INT64])
+				{
+					OPCUA_ConvertOPCUAtoPanel(doubleOPCUAConvertRatio, i, readVariant, convertedVariant);
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+					printf("[OPCUA_InsertIMMSensor]Type:Int64 IMMSN:%d IMM Sensor[NS:%2s ID:%-60s Name:%-30s]:%ld\n", intIMMSN,
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NS],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_ID],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NAME],
+						   *(UA_Int64 *)readVariant->data);
+					// *(UA_Int64*)readVariant->data);
+#endif
+					snprintf(charIMMSensorValue[i - OPCUA_IMMPARA_NODE_NUM - 1], TINY_STRING_SIZE, "'%ld'", *(UA_Int64 *)readVariant->data);
+				}
+				else if (readVariant->type == &UA_TYPES[UA_TYPES_UINT64])
+				{
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+					printf("[OPCUA_InsertIMMSensor]Type:UInt64 IMMSN:%d IMM Sensor[NS:%2s ID:%-60s Name:%-30s]:%ld\n", intIMMSN,
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NS],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_ID],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NAME],
+						   *(UA_UInt64 *)readVariant->data);
+#endif
+					snprintf(charIMMSensorValue[i - OPCUA_IMMPARA_NODE_NUM - 1], TINY_STRING_SIZE, "'%ld'", *(UA_UInt64 *)readVariant->data);
+				}
+				else if (readVariant->type == &UA_TYPES[UA_TYPES_STRING])
+				{
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+					printf("[OPCUA_InsertIMMSensor]Type:String IMMSN:%d IMM Sensor[NS:%2s ID:%-60s Name:%-30s]:%s\n", intIMMSN,
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NS],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_ID],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NAME],
+						   (char *)((UA_String *)readVariant->data));
+#endif
+					snprintf(charIMMSensorValue[i - OPCUA_IMMPARA_NODE_NUM - 1], TINY_STRING_SIZE, "'%s'", (char *)((UA_String *)readVariant->data));
+				}
+				else if (readVariant->type == &UA_TYPES[UA_TYPES_DATETIME])
+				{
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+					UA_DateTimeStruct t = UA_DateTime_toStruct(*(UA_DateTime *)readVariant->data);
+					printf("[OPCUA_InsertIMMSensor]Type:DateTime IMMSN:%d IMM Sensor[NS:%2s ID:%-60s Name:%-30s]:%4d-%02d-%02d %02d:%02d:%02d\n", intIMMSN,
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NS],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_ID],
+						   charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NAME],
+						   t.year, t.month, t.day, t.hour, t.min, t.sec);
+#endif
+					//snprintf(charIMMSensorValue[i-OPCUA_IMMPARA_NODE_NUM-1],TINY_STRING_SIZE,"%d",*(UA_Int16*)readVariant->data);
+				}
+			}
+			UA_Variant_delete(readVariant);
+			UA_Variant_delete(convertedVariant);
+		}
+	}
+
+	//bermuda
+	snprintf(charStatement, MAX_STRING_SIZE,
+			 "INSERT INTO %s_%s_%s_%d_RawData_IMMSensor.IMMSensorSNList "
+			 "("
+			 "ShotSN,                   						CycleTime,									MoldClampingTime,									MoldReleasingTime,"
+			 "InjectionTime,            						VPChangeOverTime,							HoldingTime,										PlastificationTime,"
+			 "VPChangeOverPosition,								CusionVolume,								EndHoldingPosition,									EndPlastificationPosition,"
+			 "Nozzle1Temperature,								Nozzle2Temperature,							Nozzle3Temperature,									Nozzle4Temperature,"
+			 "Nozzle5Temperature,								IMMOilTemperature,							FallMaterialTemperature,							MaxInjectionPressure,"
+			 "VPChangeOverPressure,								SumInjectionPressure,						SumHoldingPressure,									MaxCavityNearGatePressure,"
+			 "MaxCavityFarGatePressure,							SumCavityPressure,							SumMoldClampingForce,								MaxMoldClampingForce,"
+			 "BackPressure,										DelayPlastificationTime,					InMoldCoolingTemperature,							OutMoldCoolingTemperature,"
+			 "MoldCoolingVolume,								MoldReleasingPosition2,						MoldReleasingPosition3,								MoldReleasingPosition4,"
+			 "MoldReleasingPosition5,							ScrewSuckBackPosition,						ScrewRPM,											PartWeight,"
+			 "GateClosingTime,									MeltTemperature,							MoldTemperature"
+			 ") VALUE ("
+			 "%d,												%s,											%s,													%s,"
+			 "%s,												%s,											%s,													%s,"
+			 "%s,												%s,											%s,													%s,"
+			 "%s,												%s,											%s,													%s,"
+			 "%s,												%s,											%s,													%s,"
+			 "%s,												%s,											%s,													%s,"
+			 "%s,												%s,											%s,													%s,"
+			 "%s,												%s,											%s,													%s,"
+			 "%s,												%s,											%s,													%s,"
+			 "%s,												%s,											%s,													%s,"
+			 "%s,												%s,											%s"
+			 ")",
+			 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN,
+			 intShotSN,
+			 charIMMSensorValue[IMMSENSOR_CYCLE_TIME - OPCUA_IMMPARA_NODE_NUM - 1],					  //54
+			 charIMMSensorValue[IMMSENSOR_MOLD_CLAMPING_TIME - OPCUA_IMMPARA_NODE_NUM - 1],			  //55
+			 charIMMSensorValue[IMMSENSOR_MOLD_RELEASING_TIME - OPCUA_IMMPARA_NODE_NUM - 1],		  //56
+			 charIMMSensorValue[IMMSENSOR_INJECTION_TIME - OPCUA_IMMPARA_NODE_NUM - 1],				  //57
+			 charIMMSensorValue[IMMSENSOR_VPCHANGEOVER_TIME - OPCUA_IMMPARA_NODE_NUM - 1],			  //58
+			 charIMMSensorValue[IMMSENSOR_HOLDING_TIME - OPCUA_IMMPARA_NODE_NUM - 1],				  //59
+			 charIMMSensorValue[IMMSENSOR_PLASTIFICATION_TIME - OPCUA_IMMPARA_NODE_NUM - 1],		  //60
+			 charIMMSensorValue[IMMSENSOR_VPCHANGEOVER_POSITION - OPCUA_IMMPARA_NODE_NUM - 1],		  //61
+			 charIMMSensorValue[IMMSENSOR_CUSION_VOLUME - OPCUA_IMMPARA_NODE_NUM - 1],				  //62
+			 charIMMSensorValue[IMMSENSOR_END_HOLDING_POSITION - OPCUA_IMMPARA_NODE_NUM - 1],		  //63
+			 charIMMSensorValue[IMMSENSOR_END_PLASTIFICATION_POSITION - OPCUA_IMMPARA_NODE_NUM - 1],  //64
+			 charIMMSensorValue[IMMSENSOR_NOZZLE1_TEMPERATURE - OPCUA_IMMPARA_NODE_NUM - 1],		  //65
+			 charIMMSensorValue[IMMSENSOR_NOZZLE2_TEMPERATURE - OPCUA_IMMPARA_NODE_NUM - 1],		  //66
+			 charIMMSensorValue[IMMSENSOR_NOZZLE3_TEMPERATURE - OPCUA_IMMPARA_NODE_NUM - 1],		  //67
+			 charIMMSensorValue[IMMSENSOR_NOZZLE4_TEMPERATURE - OPCUA_IMMPARA_NODE_NUM - 1],		  //68
+			 charIMMSensorValue[IMMSENSOR_NOZZLE5_TEMPERATURE - OPCUA_IMMPARA_NODE_NUM - 1],		  //69
+			 charIMMSensorValue[IMMSENSOR_IMM_OIL_TEMPERATURE - OPCUA_IMMPARA_NODE_NUM - 1],		  //70
+			 charIMMSensorValue[IMMSENSOR_FALL_MATERIAL_TEMPERATURE - OPCUA_IMMPARA_NODE_NUM - 1],	//71
+			 charIMMSensorValue[IMMSENSOR_MAX_INJECTION_PRESSURE - OPCUA_IMMPARA_NODE_NUM - 1],		  //72
+			 charIMMSensorValue[IMMSENSOR_MAX_VPCHANGEOVER_PRESSURE - OPCUA_IMMPARA_NODE_NUM - 1],	//73
+			 charIMMSensorValue[IMMSENSOR_SUM_INJECTION_PRESSURE - OPCUA_IMMPARA_NODE_NUM - 1],		  //74
+			 charIMMSensorValue[IMMSENSOR_SUM_HOLDING_PRESSURE - OPCUA_IMMPARA_NODE_NUM - 1],		  //75
+			 charIMMSensorValue[IMMSENSOR_MAX_CAVITYNEARGATE_PRESSURE - OPCUA_IMMPARA_NODE_NUM - 1],  //76
+			 charIMMSensorValue[IMMSENSOR_MAX_CAVITYFARGATE_PRESSURE - OPCUA_IMMPARA_NODE_NUM - 1],   //77
+			 charIMMSensorValue[IMMSENSOR_SUM_CAVITY_PRESSURE - OPCUA_IMMPARA_NODE_NUM - 1],		  //78
+			 charIMMSensorValue[IMMSENSOR_SUM_MOLD_CLAMPING_FORCE - OPCUA_IMMPARA_NODE_NUM - 1],	  //79
+			 charIMMSensorValue[IMMSENSOR_MAX_MOLD_CLAMPING_FORCE - OPCUA_IMMPARA_NODE_NUM - 1],	  //80
+			 charIMMSensorValue[IMMSENSOR_BACK_PRESSURE - OPCUA_IMMPARA_NODE_NUM - 1],				  //81
+			 charIMMSensorValue[IMMSENSOR_DELAY_PLASTIFICATION_TIME - OPCUA_IMMPARA_NODE_NUM - 1],	//82
+			 charIMMSensorValue[IMMSENSOR_IN_MOLD_COOLING_TEMPERATURE - OPCUA_IMMPARA_NODE_NUM - 1],  //83
+			 charIMMSensorValue[IMMSENSOR_OUT_MOLD_COOLING_TEMPERATURE - OPCUA_IMMPARA_NODE_NUM - 1], //84
+			 charIMMSensorValue[IMMSENSOR_MOLD_COOLING_VOLUME - OPCUA_IMMPARA_NODE_NUM - 1],		  //85
+			 charIMMSensorValue[IMMSENSOR_MOLD_RELEASING_POSITION_2 - OPCUA_IMMPARA_NODE_NUM - 1],	//86
+			 charIMMSensorValue[IMMSENSOR_MOLD_RELEASING_POSITION_3 - OPCUA_IMMPARA_NODE_NUM - 1],	//87
+			 charIMMSensorValue[IMMSENSOR_MOLD_RELEASING_POSITION_4 - OPCUA_IMMPARA_NODE_NUM - 1],	//88
+			 charIMMSensorValue[IMMSENSOR_MOLD_RELEASING_POSITION_5 - OPCUA_IMMPARA_NODE_NUM - 1],	//89
+			 charIMMSensorValue[IMMSENSOR_SCREW_SUCK_BACK_POSITION - OPCUA_IMMPARA_NODE_NUM - 1],	 //90
+			 charIMMSensorValue[IMMSENSOR_SCREW_RPM - OPCUA_IMMPARA_NODE_NUM - 1],					  //91
+			 charIMMSensorValue[IMMSENSOR_PART_WEIGHT - OPCUA_IMMPARA_NODE_NUM - 1],				  //92
+			 charIMMSensorValue[IMMSENSOR_GATE_CLOSING_TIME - OPCUA_IMMPARA_NODE_NUM - 1],			  //93
+			 charIMMSensorValue[IMMSENSOR_MELT_TEMPERATURE - OPCUA_IMMPARA_NODE_NUM - 1],			  //94
+			 charIMMSensorValue[IMMSENSOR_MOLD_TEMPERATURE - OPCUA_IMMPARA_NODE_NUM - 1]);			  //95
+	//fprintf(stderr,"Q:%s\n",charStatement);
+	intRetval = mysql_query(&mysqlCon, charStatement);
+	if (intRetval)
+	{
+		snprintf(charErrMsg, LONG_STRING_SIZE,
+				 "Fail to insertIMM sensor data to table %s_%s_%s_%d_RawData_IMMSensor.IMMSensorSNList for Shot:%d (%d): %s",
+				 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN, intShotSN, mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+		SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+		fprintf(stderr, "Error Sended\n");
+		return EXIT_FAILURE;
+	}
+
+	return EXIT_SUCCESS;
+}
+
+int DB_InsertPreviousIMMPara(MYSQL mysqlCon)
+{
+	char charStatement[MAX_STRING_SIZE];
+	int intRetval;
+	char charErrMsg[LONG_STRING_SIZE];
+	char *charIMMParaSN;
+	unsigned int intTechnicianUserSN;
+	unsigned int intLogSN;
+	MYSQL_RES *mysqlResult;
+	MYSQL_ROW mysqlRow;
+
+	//Select Technician UserSN Where IMMSN Is Given From INJPRO_Data_IMMList
+	snprintf(charStatement, MAX_STRING_SIZE, "SELECT TechnicianUserSN FROM %s_%s.IMMList WHERE IMMSN=%d",
+			 SYS_NAME, DATA_DATABASE_NAME, intIMMSN);
+	intRetval = mysql_query(&mysqlCon, charStatement);
+	if (intRetval)
+	{
+		snprintf(charErrMsg, LONG_STRING_SIZE, "[DB_InsertPreviousIMMPara]Fail to select TechnicianUserSN where IMMSN=%d from %s_%s.IMMList (%d):%s",
+				 intIMMSN, SYS_NAME, DATA_DATABASE_NAME, mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+		intLogSN = SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+		return intLogSN;
+	}
+	else
+	{
+		mysqlResult = mysql_store_result(&mysqlCon);
+		mysqlRow = mysql_fetch_row(mysqlResult);
+		if (mysqlRow[0] != NULL)
+		{
+			intTechnicianUserSN = atoi(mysqlRow[0]);
+		}
+		else
+		{
+			intTechnicianUserSN = 0;
+		}
+		mysql_free_result(mysqlResult);
+	}
+
+	//Select Last IMMPara from INJPRO_DATA_MO_[MOSN]_RawData_IMMPara.IMMParaSNList
+	snprintf(charStatement, MAX_STRING_SIZE,
+			 "INSERT INTO %s_%s_%s_%d_RawData_IMMPara.IMMParaSNList "
+			 "(	IMMParaSN,				TechnicianUserSN,			IMMParaLastUpdateTime,	"
+			 "InjectStage,				HoldStage,					PlasStage,				"
+			 "MeltTemperature,			"
+			 "PlastificationVolume1,	PlastificationVolume2,		PlastificationVolume3,		PlastificationVolume4,		PlastificationVolume5,"
+			 "InjectionPressure1,		InjectionPressure2,			InjectionPressure3,			InjectionPressure4,			InjectionPressure5,"
+			 "InjectionSpeed1,			InjectionSpeed2,			InjectionSpeed3,			InjectionSpeed4,			InjectionSpeed5,"
+			 "VPChangeOverPosition,		VPChangeOverTime,			PackingPressure,			"
+			 "HoldingPressure1,			HoldingPressure2,			HoldingPressure3,			HoldingPressure4,			HoldingPressure5,"
+			 "PackingTime,				"
+			 "HoldingTime1,				HoldingTime2,				HoldingTime3,				HoldingTime4,				HoldingTime5,"
+			 "CoolingTime,				"
+			 "ScrewRPM1,				ScrewRPM2,					ScrewRPM3,					ScrewRPM4,					ScrewRPM5,"
+			 "BackPressure1,			BackPressure2,				BackPressure3,				BackPressure4,	 			BackPressure5,"
+			 "MoldTemperature	"
+			 ") SELECT "
+			 "%d,						%d,							NOW(6),"
+			 "InjectStage,				HoldStage, 					PlasStage,					"
+			 "MeltTemperature,			"
+			 "PlastificationVolume1,	PlastificationVolume2,		PlastificationVolume3,		PlastificationVolume4,		PlastificationVolume5,"
+			 "InjectionPressure1,		InjectionPressure2,			InjectionPressure3,			InjectionPressure4,			InjectionPressure5,"
+			 "InjectionSpeed1,			InjectionSpeed2,			InjectionSpeed3,			InjectionSpeed4,			InjectionSpeed5,"
+			 "VPChangeOverPosition,		VPChangeOverTime,			PackingPressure,			"
+			 "HoldingPressure1,			HoldingPressure2,			HoldingPressure3,			HoldingPressure4,			HoldingPressure5,"
+			 "PackingTime,				"
+			 "HoldingTime1,				HoldingTime2,				HoldingTime3,				HoldingTime4,				HoldingTime5,"
+			 "CoolingTime,		"
+			 "ScrewRPM1,				ScrewRPM2,					ScrewRPM3,					ScrewRPM4,					ScrewRPM5,"
+			 "BackPressure1,			BackPressure2,				BackPressure3,				BackPressure4,				BackPressure5,"
+			 "MoldTemperature	"
+			 "FROM %s_%s_%s_%d_RawData_IMMPara.IMMParaSNList WHERE IMMParaSN=%d",
+			 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN,
+			 intIMMParaSN, intTechnicianUserSN,
+			 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN, intIMMParaSN - 1);
+
+	intRetval = mysql_query(&mysqlCon, charStatement);
+	if (intRetval)
+	{
+		snprintf(charErrMsg, LONG_STRING_SIZE,
+				 "[DB_InsertPreviousIMMPara]Fail to select/insert previous IMMPara:%d row from table %s_%s_%s_%d_RawData_IMMPara.IMMParaSNList (%d): %s",
+				 intIMMParaSN - 1, SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN, mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+		intLogSN = SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+		return intLogSN;
+	}
+	return EXIT_SUCCESS;
+}
+
+static void handler_IMMChanged(UA_Client *client, UA_UInt32 subId, void *subContext, UA_UInt32 monId, void *monContext, UA_DataValue *value)
+{
+
+	MYSQL mysqlCon;
+	char charStatement[MAX_STRING_SIZE];
+	char charErrMsg[LONG_STRING_SIZE];
+	int intRetval;
+	char *charIMMParaSN;
+	unsigned int intMOSensorTableSN;
+	unsigned int intTechnicianUserSN;
+	bool boolErrorShot = false;
+	MYSQL_RES *mysqlResult;
+	MYSQL_ROW mysqlRow;
+	char charCommand[MAX_STRING_SIZE];
+	unsigned int intRoundSN;
+
+	mysql_init(&mysqlCon);
+	if (!mysql_real_connect(&mysqlCon, MYSQL_SERVER_IP, MYSQL_USER_NAME, MYSQL_PASSWORD, NULL, 0, NULL, CLIENT_FOUND_ROWS))
+	{
+		if (mysql_errno(&mysqlCon))
+			fprintf(stderr, "Fail to connect to MySql server %d: %s", mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+		return;
+	}
+
+	//Select Technician UserSN Where IMMSN Is Given From INJPRO_Data_IMMList
+	snprintf(charStatement, MAX_STRING_SIZE, "SELECT TechnicianUserSN FROM %s_%s.IMMList WHERE IMMSN=%d",
+			 SYS_NAME, DATA_DATABASE_NAME, intIMMSN);
+	intRetval = mysql_query(&mysqlCon, charStatement);
+	if (intRetval)
+	{
+		snprintf(charErrMsg, LONG_STRING_SIZE, "[handler_IMMChanged]Fail to select TechnicianUserSN where IMMSN=%d from %s_%s.IMMList (%d):%s",
+				 intIMMSN, SYS_NAME, DATA_DATABASE_NAME, mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+		SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+		return;
+	}
+	else
+	{
+		mysqlResult = mysql_store_result(&mysqlCon);
+		mysqlRow = mysql_fetch_row(mysqlResult);
+		if (mysqlRow[0] != NULL)
+		{
+			intTechnicianUserSN = atoi(mysqlRow[0]);
+		}
+		else
+		{
+			intTechnicianUserSN = 0;
+		}
+		mysql_free_result(mysqlResult);
+	}
+	//fprintf(stderr,"ID:%d\n",intTechnicianUserSN);
+
+	if (intMonIDNodeIndex[monId] != IMMPARA_DI_MOLD_CLAMPED && intMonIDNodeIndex[monId] != IMMPARA_DI_MOLD_RELEASED && boolHasIMMParaChanged == false)
+	{
+		boolHasIMMParaChanged = true;
+		intRetval = DB_InsertPreviousIMMPara(mysqlCon);
+		if (intRetval != EXIT_SUCCESS)
+		{
+			snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Fail to insert previous IMM parameter for IMMSN:%d while ShotSN:%d", intIMMSN, intShotSN);
+			SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+		}
+	}
+
+	if (intMonIDNodeIndex[monId] != IMMPARA_DI_MOLD_CLAMPED && intMonIDNodeIndex[monId] != IMMPARA_DI_MOLD_RELEASED && boolIsMoldClamped == true)
+	{
+		snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]IMMSN:%d ShotSN:%d TechnicianUserSN:%d Parameter:%s is changed after mold clamped",
+				 intIMMSN, intShotSN, intTechnicianUserSN, charMonIDNodeIndex[monId]);
+		SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, 0, charErrMsg);
+		boolErrorShot = true;
+	}
+
+	switch (intMonIDNodeIndex[monId])
+	{
+	case IMMPARA_DI_MOLD_CLAMPED:
+	{
+		//Mold Clamped
+		if (*(UA_Boolean *)value->value.data == 1)
+		{
+			fprintf(stderr, "[SubscribeIMM]The mold of IMMSN:%d is clamped\n", intIMMSN);
+			intRetval = IMM_SetIMMMoldStatus(mysqlCon, intIMMSN, MOLD_STATUS_CLAMPED);
+
+			//Flag Setting
+			boolIsMoldClamped = true;
+			boolHasMoldClamped = true;
+
+			//Update ClampedTime to INJPRO_DATA_MO_[MOSN]_RawData.ShotSNList
+			snprintf(charStatement, MAX_STRING_SIZE,
+					 "UPDATE %s_%s_%s_%d_RawData.ShotSNList SET MoldClampedTime=NOW(6) WHERE ShotSN=%d",
+					 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN, intShotSN);
+			intRetval = mysql_query(&mysqlCon, charStatement);
+			if (intRetval)
+			{
+				snprintf(charErrMsg, LONG_STRING_SIZE,
+						 "Fail to update ClampedTime of ShotSN:%d while mold clamped to table %s_%s_%s_%d_RawData.ShotSNList (%d): %s",
+						 intShotSN, SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN, mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+				SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+				return;
+			}
+
+			//Determine MOSensorTableSN (1~MAX_MOLD_SENSOR_SHOTSN_SIZE=>TableSN=1)
+			//intMOSensorTableSN=(intShotSN-1)/MAX_MOLD_SENSOR_SHOTSN_SIZE+1;
+
+			/*
+				//for(int intMOSensorSN=1
+				//Create Table INJPRO_Data_MO_[MOSN]_RawData_MoldSensor.[MOSensorSN]_[TableSN]
+				snprintf(charStatement,MAX_STRING_SIZE,"CREATE TABLE IF NOT EXISTS %s_%s_%s_%d_RawData_MoldSensor.MOSensorSN%d_TableSN%d ("
+				 "ShotSN	BIGINT UNSIGNED NOT NULL,"
+	 			 "ElapsedTime	DOUBLE UNSIGNED,"
+				 "SensorValue	DOUBLE,"
+				 "INDEX (ShotSN))"
+				 //"CONSTRAINT %d_MOSensorSN_%d_TableSN_%d_ShotSN FOREIGN KEY (ShotSN) REFERENCES %s_%s_%s_%d_RawData.ShotSNList(ShotSN) ON UPDATE CASCADE)"
+				 "ENGINE=InnoDB",
+				 SYS_NAME,DATA_DATABASE_NAME,MO_DATABASE_NAME,intMOSN,intMOSensorSN,intMOSensorTableSN);
+				 //intMOSN,intMOSensorSN,1,SYS_NAME,DATA_DATABASE_NAME,MO_DATABASE_NAME,intMOSN);
+				intRetval=mysql_query(&mysqlCon,charStatement);
+				if(intRetval){
+					snprintf(charErrMsg,LONG_STRING_SIZE,"[SubscribeIMM]Fail to create table %s_%s_%s_%d_RawData_MoldSensor.MOSensorSN%d_TableSN%d (%d): %s",
+					 SYS_NAME,DATA_DATABASE_NAME,MO_DATABASE_NAME,intMOSN,intMOSensorSN,mysql_errno(&mysqlCon),mysql_error(&mysqlCon));
+					SYS_InsertSysErrMsg(mysqlCon,ERRCLASS_MYSQL,intMOSN,intIMMSN,intMOSensorTableSN,mysql_errno(&mysqlCon),charErrMsg);
+				}
+				*/
+		}
+		else
+		{
+			boolIsMoldClamped = false;
+			//Releasing
+			if (boolHasMoldClamped)
+			{
+				fprintf(stderr, "[SubscribeIMM]The mold of IMMSN:%d is releasing\n", intIMMSN);
+				intRetval = IMM_SetIMMMoldStatus(mysqlCon, intIMMSN, MOLD_STATUS_RELEASING);
+
+				//Update ReleasingTime and ClampedCycleTime to INJPRO_DATA_MO_[MOSN]_RawData.ShotSNList
+				snprintf(charStatement, MAX_STRING_SIZE,
+						 "UPDATE %s_%s_%s_%d_RawData.ShotSNList SET MoldReleasingTime=NOW(6),"
+						 "ClampedCycleTime=TIMESTAMPDIFF(Microsecond,MoldClampedTime,NOW(6))/1000000 WHERE ShotSN=%d",
+						 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN, intShotSN);
+				intRetval = mysql_query(&mysqlCon, charStatement);
+				if (intRetval)
+				{
+					snprintf(charErrMsg, LONG_STRING_SIZE,
+							 "Fail to update MoldReleasingTime and ClampedCycleTime of ShotSN:%d "
+							 "while mold releasing to table %s_%s_%s_%d_RawData.ShotSNList (%d): %s",
+							 intShotSN, SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN, mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+					SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+					return;
+				}
+
+//Insert  IMM Sensor and if it is not a emluator OPC UA server
+#ifdef ENABLE_IMM_SENSOR
+				if (intOPCUAVersionSN != 1)
+					intRetval = OPCUA_InsertIMMSensor(mysqlCon, client, intShotSN);
+#endif
+
+				//intRetval=IMM_TuneIMMParaByRecom(mysqlCon,intIMMSN,intMOSN,1);
+
+				//Performance Accept Criteria Inference
+				//intRetval=NN_AcceptCriteriaInference(mysqlCon,intMOSN,intIMMSN,intExpectedProductVolume,intCountAcceptCriteriaSN,intShotSN,
+				// intMOAcceptCriteriaSNTHFlag,doubleMOAcceptCriteriaSNTH);
+			}
+		}
+	}
+	break;
+
+	case IMMPARA_DI_MOLD_RELEASED:
+	{
+		//Mold Released
+		if (*(UA_Boolean *)value->value.data == 1)
+		{
+			fprintf(stderr, "[SubscribeIMM]The mold of IMMSN:%d is released\n", intIMMSN);
+			intRetval = IMM_SetIMMMoldStatus(mysqlCon, intIMMSN, MOLD_STATUS_RELEASED);
+
+			//Update Info
+			intRetval = DB_UpdateMOListAfterShot(mysqlCon, intMOSN, false);
+			if (intRetval != EXIT_SUCCESS)
+			{
+
+				snprintf(charErrMsg, LONG_STRING_SIZE,
+						 "[SubscribeIMM]Fail to update information (DB_UpdateMOListAfterShot) for ShotSN:%d \n", intShotSN);
+				SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_DB, intMOSN, intIMMSN, 0, charErrMsg);
+				//return EXIT_FAILURE;
+			}
+
+			//Set Flag
+			boolHasMoldReleased = true;
+
+			//If the mold is released and has been clamped (A complete shot)
+			if (boolHasMoldClamped)
+			{
+				boolHasMoldClamped = false;
+
+				//Insert Quality Predict Result
+#ifdef ENABLE_QUALITY_INFERENCE
+				fprintf(stderr, "MOSN:%d ShotSN:%d Quality Predict Insert\n", intMOSN, intShotSN);
+				srand((unsigned)time(NULL));
+				if ((double)rand() / RAND_MAX < 0.20)
+					intRetval = DB_InsertMOAcceptCriteriaPredictValue(mysqlCon, intMOSN, intShotSN, 1, "1");
+				else
+					intRetval = DB_InsertMOAcceptCriteriaPredictValue(mysqlCon, intMOSN, intShotSN, 1, "0");
+#endif
+
+				//If the IMMPara has been changed thean IMMParaSN+=1
+				if (boolHasIMMParaChanged == true)
+				{
+					char *charIMMParaSN;
+					snprintf(charStatement, MAX_STRING_SIZE, "%s_%s_%s_%d_RawData_IMMPara.IMMParaSNList",
+							 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN);
+					intRetval = DB_SelectColumnMax(mysqlCon, charStatement, "IMMParaSN", &charIMMParaSN);
+					intIMMParaSN = atoi(charIMMParaSN) + 1;
+					boolHasIMMParaChanged = false;
+				}
+
+				//Update the New Shot to INJPRO_DATA_MO_[MOSN]_RawData.ShotSNList
+				snprintf(charStatement, MAX_STRING_SIZE,
+						 "UPDATE %s_%s_%s_%d_RawData.ShotSNList SET MoldReleasedTime=NOW(6),"
+						 "CycleTime=TIMESTAMPDIFF(Microsecond,MoldClampingTime,NOW(6))/1000000,ErrorShot = %s WHERE ShotSN = %d",
+						 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME,
+						 intMOSN, boolErrorShot == 1 ? "1" : "CASE WHEN MoldClampingTime IS NOT NULL AND "
+															 "MoldClampedTime IS NOT NULL AND "
+															 "MoldReleasingTime IS NOT NULL AND "
+															 "MoldReleasedTime IS NOT NULL THEN 0 "
+															 "ELSE 1 END",
+						 intShotSN);
+				intRetval = mysql_query(&mysqlCon, charStatement);
+				if (intRetval)
+				{
+					snprintf(charErrMsg, LONG_STRING_SIZE,
+							 "Fail to update ShotSN:%d while mold released to table %s_%s_%s_%d_RawData.ShotSNList (%d): %s",
+							 intShotSN, SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN, mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+					SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+					return;
+				}
+
+				//Update ShotSN=ShotSN+1 in INJPRO.Data.IMMList
+				snprintf(charStatement, MAX_STRING_SIZE,
+						 "UPDATE %s_%s.IMMList SET ShotSN=%d, IMMLastUpdateTime=NOW(6) WHERE IMMSN=%d",
+						 SYS_NAME, DATA_DATABASE_NAME, intShotSN + 1, intIMMSN);
+				intRetval = mysql_query(&mysqlCon, charStatement);
+				if (intRetval)
+				{
+					snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Fail to update ShotSN in table %s_%s.IMMList (%d): %s",
+							 SYS_NAME, DATA_DATABASE_NAME, mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+					SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+					return;
+				}
+
+				//Caculate Mold Pressure Pressure Sensor SPC Feature Value
+				//snprintf(charCommand,MAX_STRING_SIZE,"./exeInsertSPCFeatureValue -MOSN %d -ShotSN %d %d -MOSensorSN 1 2 &",intMOSN,intShotSN,intShotSN);
+				//system(charCommand);
+
+				//if(intShotSN==26){
+				//	snprintf(charCommand,MAX_STRING_SIZE,"./exeInsertSPCCL -MOSN %d -ShotSN 1 25 &",intMOSN);
+				//system(charCommand);
+				//}
+
+				intShotSN++;
+
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+				fprintf(stderr, "[SubscribeIMM]IMMSN:%d MOSN:%d ShotSN:%d is ready to start\n", intIMMSN, intMOSN, intShotSN);
+#endif
+			}
+		}
+		else if (*(UA_Boolean *)value->value.data == 0)
+		{
+			//Mold Clamping
+			if (boolHasMoldReleased == true)
+			{
+				fprintf(stderr, "[SubscribeIMM]The mold of IMMSN:%d is clamping\n", intIMMSN);
+				intRetval = IMM_SetIMMMoldStatus(mysqlCon, intIMMSN, MOLD_STATUS_CLAMPING);
+				if (intRetval != EXIT_SUCCESS)
+				{
+					snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Fail to update MoldStatus for IMMSN:%d in table %s_%s.IMMList",
+							 intIMMSN, SYS_NAME, DATA_DATABASE_NAME);
+					SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, 0, charErrMsg);
+				}
+
+				intRetval = DB_SelectCurrentRoundSN(mysqlCon, intIMMSN, &intRoundSN);
+				fprintf(stderr, "RoundSN:%d\n", intRoundSN);
+				if (intRetval != EXIT_SUCCESS)
+				{
+					snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Fail to select RoundSN for IMMSN:%d in table %s_%s.IMMList",
+							 intIMMSN, SYS_NAME, DATA_DATABASE_NAME);
+					SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, 0, charErrMsg);
+				}
+
+				//If It Is a Virtual OPC UA server
+				if (intOPCUAVersionSN == 1)
+				{
+					snprintf(charStatement, MAX_STRING_SIZE,
+							 "INSERT INTO %s_%s_%s_%d_RawData.ShotSNList "
+							 "(ShotSN,RoundSN,MoldClampingTime,IMMParaSN,MOSensorTableSN,ErrorShot) VALUE "
+							 "(%d,%d,NOW(6),NULL,%d,1)",
+							 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN,
+							 intShotSN, intRoundSN, (intShotSN - 1) / SHOT_NUM_PER_TABLE + 1);
+				}
+				else
+				{
+					snprintf(charStatement, MAX_STRING_SIZE,
+							 "INSERT INTO %s_%s_%s_%d_RawData.ShotSNList "
+							 "(ShotSN,RoundSN, MoldClampingTime,IMMParaSN,MOSensorTableSN,ErrorShot) VALUE "
+							 "(%d,%d,NOW(6),%d,%d,1)",
+							 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN,
+							 intShotSN, intRoundSN, boolHasIMMParaChanged == true ? intIMMParaSN : intIMMParaSN - 1, (intShotSN - 1) / SHOT_NUM_PER_TABLE + 1);
+				}
+				intRetval = mysql_query(&mysqlCon, charStatement);
+				if (intRetval)
+				{
+					snprintf(charErrMsg, LONG_STRING_SIZE,
+							 "[SubscribeIMM]Fail to insert ShotSN to table %s_%s_%s_%d_RawData.ShotSNList (%d): %s",
+							 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN, mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+					SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+					return;
+				}
+				boolHasMoldReleased = false;
+			}
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+//fprintf(stderr,"[SubscribeIMM]The mold of IMMSN:%d is releasing\n",intIMMSN);
+#endif
+		}
+	}
+	break;
+
+	case IMMPARA_DI_ALARM_LAMP:
+	case IMMPARA_DI_STOPPED_LAMP:
+	case IMMPARA_DI_RUNNING_LAMP:
+	case IMMPARA_DI_MOTOR_START:
+	case IMMPARA_DI_OPERATION_MODE:
+	case IMMPARA_DI_HEAT_ON:
+		break;
+
+	default:
+	{
+
+		UA_Variant *convertedVariant = UA_Variant_new();
+		OPCUA_ConvertOPCUAtoPanel(doubleOPCUAConvertRatio, intMonIDNodeIndex[monId], &value->value, convertedVariant);
+		if (convertedVariant->type->typeIndex == UA_TYPES_FLOAT)
+		{
+			snprintf(charStatement, MAX_STRING_SIZE,
+					 "INSERT INTO %s_%s_%s_%d_RawData_IMMPara.IMMParaSNList (IMMParaSN,TechnicianUserSN,IMMParaLastUpdateTime,%s) VALUE (%d,%d,NOW(6),%f) "
+					 "ON DUPLICATE KEY UPDATE %s=%f,TechnicianUserSN=%d,IMMParaLastUpdateTime=NOW(6)",
+					 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN, charMonIDNodeIndex[monId],
+					 intIMMParaSN, intTechnicianUserSN, *(UA_Float *)convertedVariant->data, charMonIDNodeIndex[monId], *(UA_Float *)convertedVariant->data, intTechnicianUserSN);
+		}
+		else if (convertedVariant->type->typeIndex == UA_TYPES_DOUBLE)
+		{
+			snprintf(charStatement, MAX_STRING_SIZE,
+					 "INSERT INTO %s_%s_%s_%d_RawData_IMMPara.IMMParaSNList (IMMParaSN,TechnicianUserSN,IMMParaLastUpdateTime,%s) VALUE (%d,%d,NOW(6),%f) "
+					 "ON DUPLICATE KEY UPDATE %s=%f,TechnicianUserSN=%d,IMMParaLastUpdateTime=NOW(6)",
+					 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN, charMonIDNodeIndex[monId],
+					 intIMMParaSN, intTechnicianUserSN, *(UA_Double *)convertedVariant->data, charMonIDNodeIndex[monId], *(UA_Double *)convertedVariant->data, intTechnicianUserSN);
+		}
+		else if (convertedVariant->type->typeIndex == UA_TYPES_INT16)
+		{
+			snprintf(charStatement, MAX_STRING_SIZE,
+					 "INSERT INTO %s_%s_%s_%d_RawData_IMMPara.IMMParaSNList (IMMParaSN,TechnicianUserSN,IMMParaLastUpdateTime,%s) VALUE (%d,%d,NOW(6),%d) "
+					 "ON DUPLICATE KEY UPDATE %s=%d,TechnicianUserSN=%d,IMMParaLastUpdateTime=NOW(6)",
+					 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN, charMonIDNodeIndex[monId],
+					 intIMMParaSN, intTechnicianUserSN, *(UA_Int16 *)convertedVariant->data, charMonIDNodeIndex[monId], *(UA_Int16 *)convertedVariant->data, intTechnicianUserSN);
+		}
+		else if (convertedVariant->type->typeIndex == UA_TYPES_UINT16)
+		{
+			snprintf(charStatement, MAX_STRING_SIZE,
+					 "INSERT INTO %s_%s_%s_%d_RawData_IMMPara.IMMParaSNList (IMMParaSN,TechnicianUserSN,IMMParaLastUpdateTime,%s) VALUE (%d,%d,NOW(6),%d) "
+					 "ON DUPLICATE KEY UPDATE %s=%d,TechnicianUserSN=%d,IMMParaLastUpdateTime=NOW(6)",
+					 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN, charMonIDNodeIndex[monId],
+					 intIMMParaSN, intTechnicianUserSN, *(UA_UInt16 *)convertedVariant->data, charMonIDNodeIndex[monId], *(UA_UInt16 *)convertedVariant->data, intTechnicianUserSN);
+		}
+		else if (convertedVariant->type->typeIndex == UA_TYPES_INT32)
+		{
+			snprintf(charStatement, MAX_STRING_SIZE,
+					 "INSERT INTO %s_%s_%s_%d_RawData_IMMPara.IMMParaSNList (IMMParaSN,TechnicianUserSN,IMMParaLastUpdateTime,%s) VALUE (%d,%d,NOW(6),%d) "
+					 "ON DUPLICATE KEY UPDATE %s=%d,TechnicianUserSN=%d,IMMParaLastUpdateTime=NOW(6)",
+					 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN, charMonIDNodeIndex[monId],
+					 intIMMParaSN, intTechnicianUserSN, *(UA_Int32 *)convertedVariant->data, charMonIDNodeIndex[monId], *(UA_Int32 *)convertedVariant->data, intTechnicianUserSN);
+		}
+		else if (convertedVariant->type->typeIndex == UA_TYPES_UINT32)
+		{
+			snprintf(charStatement, MAX_STRING_SIZE,
+					 "INSERT INTO %s_%s_%s_%d_RawData_IMMPara.IMMParaSNList (IMMParaSN,TechnicianUserSN,IMMParaLastUpdateTime,%s) VALUE (%d,%d,NOW(6),%d) "
+					 "ON DUPLICATE KEY UPDATE %s=%d,TechnicianUserSN=%d,IMMParaLastUpdateTime=NOW(6)",
+					 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN, charMonIDNodeIndex[monId],
+					 intIMMParaSN, intTechnicianUserSN, *(UA_UInt32 *)convertedVariant->data, charMonIDNodeIndex[monId], *(UA_UInt32 *)convertedVariant->data, intTechnicianUserSN);
+		}
+		else if (convertedVariant->type->typeIndex == UA_TYPES_INT64)
+		{
+			snprintf(charStatement, MAX_STRING_SIZE,
+					 "INSERT INTO %s_%s_%s_%d_RawData_IMMPara.IMMParaSNList (IMMParaSN,TechnicianUserSN,IMMParaLastUpdateTime,%s) VALUE (%d,%d,NOW(6),%ld) "
+					 "ON DUPLICATE KEY UPDATE %s=%ld,TechnicianUserSN=%d,IMMParaLastUpdateTime=NOW(6)",
+					 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN, charMonIDNodeIndex[monId],
+					 intIMMParaSN, intTechnicianUserSN, *(UA_Int64 *)convertedVariant->data, charMonIDNodeIndex[monId], *(UA_Int64 *)convertedVariant->data, intTechnicianUserSN);
+		}
+		else if (convertedVariant->type->typeIndex == UA_TYPES_UINT64)
+		{
+			snprintf(charStatement, MAX_STRING_SIZE,
+					 "INSERT INTO %s_%s_%s_%d_RawData_IMMPara.IMMParaSNList (IMMParaSN,TechnicianUserSN,IMMParaLastUpdateTime,%s) VALUE (%d,%d,NOW(6),%ld) "
+					 "ON DUPLICATE KEY UPDATE %s=%ld,TechnicianUserSN=%d,IMMParaLastUpdateTime=NOW(6)",
+					 SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN, charMonIDNodeIndex[monId],
+					 intIMMParaSN, intTechnicianUserSN, *(UA_UInt64 *)convertedVariant->data, charMonIDNodeIndex[monId], *(UA_UInt64 *)convertedVariant->data, intTechnicianUserSN);
+		}
+
+		/*
+			if(value->value.type->typeIndex==UA_TYPES_FLOAT){
+				snprintf(charStatement,MAX_STRING_SIZE,
+				 "INSERT INTO %s_%s_%s_%d_RawData_IMMPara.IMMParaSNList (IMMParaSN,TechnicianUserSN,IMMParaLastUpdateTime,%s) VALUE (%d,%d,NOW(6),%f) "
+				 "ON DUPLICATE KEY UPDATE %s=%f,TechnicianUserSN=%d,IMMParaLastUpdateTime=NOW(6)",
+				 SYS_NAME,DATA_DATABASE_NAME,MO_DATABASE_NAME,intMOSN,charMonIDNodeIndex[monId],
+				 intIMMParaSN,intTechnicianUserSN,*(UA_Float*)value->value.data,charMonIDNodeIndex[monId],*(UA_Float*)value->value.data,intTechnicianUserSN);
+			}else if(value->value.type->typeIndex==UA_TYPES_DOUBLE){
+				snprintf(charStatement,MAX_STRING_SIZE,
+				 "INSERT INTO %s_%s_%s_%d_RawData_IMMPara.IMMParaSNList (IMMParaSN,TechnicianUserSN,IMMParaLastUpdateTime,%s) VALUE (%d,%d,NOW(6),%f) "
+				 "ON DUPLICATE KEY UPDATE %s=%f,TechnicianUserSN=%d,IMMParaLastUpdateTime=NOW(6)",
+				 SYS_NAME,DATA_DATABASE_NAME,MO_DATABASE_NAME,intMOSN,charMonIDNodeIndex[monId],
+				 intIMMParaSN,intTechnicianUserSN,*(UA_Double*)value->value.data,charMonIDNodeIndex[monId],*(UA_Double*)value->value.data,intTechnicianUserSN);
+			}else if(value->value.type->typeIndex==UA_TYPES_INT16){
+				snprintf(charStatement,MAX_STRING_SIZE,
+				 "INSERT INTO %s_%s_%s_%d_RawData_IMMPara.IMMParaSNList (IMMParaSN,TechnicianUserSN,IMMParaLastUpdateTime,%s) VALUE (%d,%d,NOW(6),%d) "
+				 "ON DUPLICATE KEY UPDATE %s=%d,TechnicianUserSN=%d,IMMParaLastUpdateTime=NOW(6)",
+				 SYS_NAME,DATA_DATABASE_NAME,MO_DATABASE_NAME,intMOSN,charMonIDNodeIndex[monId],
+				 intIMMParaSN,intTechnicianUserSN,*(UA_Int16*)value->value.data,charMonIDNodeIndex[monId],*(UA_Int16*)value->value.data,intTechnicianUserSN);
+			}else if(value->value.type->typeIndex==UA_TYPES_UINT16){
+				snprintf(charStatement,MAX_STRING_SIZE,
+				 "INSERT INTO %s_%s_%s_%d_RawData_IMMPara.IMMParaSNList (IMMParaSN,TechnicianUserSN,IMMParaLastUpdateTime,%s) VALUE (%d,%d,NOW(6),%d) "
+				 "ON DUPLICATE KEY UPDATE %s=%d,TechnicianUserSN=%d,IMMParaLastUpdateTime=NOW(6)",
+				 SYS_NAME,DATA_DATABASE_NAME,MO_DATABASE_NAME,intMOSN,charMonIDNodeIndex[monId],
+				 intIMMParaSN,intTechnicianUserSN,*(UA_UInt16*)value->value.data,charMonIDNodeIndex[monId],*(UA_UInt16*)value->value.data,intTechnicianUserSN);
+			}else if(value->value.type->typeIndex==UA_TYPES_INT32){
+				snprintf(charStatement,MAX_STRING_SIZE,
+				 "INSERT INTO %s_%s_%s_%d_RawData_IMMPara.IMMParaSNList (IMMParaSN,TechnicianUserSN,IMMParaLastUpdateTime,%s) VALUE (%d,%d,NOW(6),%d) "
+				 "ON DUPLICATE KEY UPDATE %s=%d,TechnicianUserSN=%d,IMMParaLastUpdateTime=NOW(6)",
+				 SYS_NAME,DATA_DATABASE_NAME,MO_DATABASE_NAME,intMOSN,charMonIDNodeIndex[monId],
+				 intIMMParaSN,intTechnicianUserSN,*(UA_Int32*)value->value.data,charMonIDNodeIndex[monId],*(UA_Int32*)value->value.data,intTechnicianUserSN);
+			}else if(value->value.type->typeIndex==UA_TYPES_UINT32){
+				snprintf(charStatement,MAX_STRING_SIZE,
+				 "INSERT INTO %s_%s_%s_%d_RawData_IMMPara.IMMParaSNList (IMMParaSN,TechnicianUserSN,IMMParaLastUpdateTime,%s) VALUE (%d,%d,NOW(6),%d) "
+				 "ON DUPLICATE KEY UPDATE %s=%d,TechnicianUserSN=%d,IMMParaLastUpdateTime=NOW(6)",
+				 SYS_NAME,DATA_DATABASE_NAME,MO_DATABASE_NAME,intMOSN,charMonIDNodeIndex[monId],
+				intIMMParaSN,intTechnicianUserSN,*(UA_UInt32*)value->value.data,charMonIDNodeIndex[monId],*(UA_UInt32*)value->value.data,intTechnicianUserSN);
+			}else if(value->value.type->typeIndex==UA_TYPES_INT64){
+				snprintf(charStatement,MAX_STRING_SIZE,
+				 "INSERT INTO %s_%s_%s_%d_RawData_IMMPara.IMMParaSNList (IMMParaSN,TechnicianUserSN,IMMParaLastUpdateTime,%s) VALUE (%d,%d,NOW(6),%ld) "
+				 "ON DUPLICATE KEY UPDATE %s=%ld,TechnicianUserSN=%d,IMMParaLastUpdateTime=NOW(6)",
+				 SYS_NAME,DATA_DATABASE_NAME,MO_DATABASE_NAME,intMOSN,charMonIDNodeIndex[monId],
+				intIMMParaSN,intTechnicianUserSN,*(UA_Int64*)value->value.data,charMonIDNodeIndex[monId],*(UA_Int64*)value->value.data,intTechnicianUserSN);
+			}else if(value->value.type->typeIndex==UA_TYPES_UINT64){
+				snprintf(charStatement,MAX_STRING_SIZE,
+				 "INSERT INTO %s_%s_%s_%d_RawData_IMMPara.IMMParaSNList (IMMParaSN,TechnicianUserSN,IMMParaLastUpdateTime,%s) VALUE (%d,%d,NOW(6),%ld) "
+				 "ON DUPLICATE KEY UPDATE %s=%ld,TechnicianUserSN=%d,IMMParaLastUpdateTime=NOW(6)",
+				 SYS_NAME,DATA_DATABASE_NAME,MO_DATABASE_NAME,intMOSN,charMonIDNodeIndex[monId],
+				intIMMParaSN,intTechnicianUserSN,*(UA_UInt64*)value->value.data,charMonIDNodeIndex[monId],*(UA_UInt64*)value->value.data,intTechnicianUserSN);
+			}*/
+		intRetval = mysql_query(&mysqlCon, charStatement);
+		if (intRetval)
+		{
+			fprintf(stderr, "Q:%s\n", charStatement);
+			snprintf(charErrMsg, LONG_STRING_SIZE,
+					 "Fail to insert/update %s in table %s_%s_%s_%d_RawData_IMMPara.IMMParaSNList (%d): %s",
+					 charMonIDNodeIndex[monId], SYS_NAME, DATA_DATABASE_NAME, MO_DATABASE_NAME, intMOSN, mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+			SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+			return;
+		}
+	}
+	}
+
+	//Update INJPRO_Data.IMMList Set IMMLastUpdateTime as NOW Where IMMSN Is Given
+	snprintf(charStatement, MAX_STRING_SIZE, "UPDATE %s_%s.IMMList SET IMMLastUpdateTime=NOW(6) WHERE IMMSN=%d",
+			 SYS_NAME, DATA_DATABASE_NAME, intIMMSN);
+	intRetval = mysql_query(&mysqlCon, charStatement);
+	if (intRetval)
+	{
+		snprintf(charErrMsg, LONG_STRING_SIZE,
+				 "Fail to update IMMLastUpdateTime in table %s_%s.IMMList for IMMSN:%d (%d): %s",
+				 SYS_NAME, DATA_DATABASE_NAME, intMOSN, mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+		SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+		return;
+	}
+
+#ifdef DEBUG_MODE_SUBSCRIBEIMM_MONITOR_ITEM
+	if (value->value.type->typeIndex == UA_TYPES_DATETIME)
+	{
+		UA_DateTimeStruct t = UA_DateTime_toStruct(*(UA_DateTime *)value->value.data);
+		fprintf(stderr, "[SubscribeIMM]IMMSN:%d IMM Parameter [SubID:%d MonID:%3d NodeName:%-20s:%4d-%02d-%02d %02d:%02d:%02d]\n",
+				intIMMSN, subId, monId, charMonIDNodeIndex[monId], t.year, t.month, t.day, t.hour, t.min, t.sec);
+	}
+	else if (value->value.type->typeIndex == UA_TYPES_BOOLEAN)
+	{
+		fprintf(stderr, "[SubscribeIMM]IMMSN:%d IMM Parameter [SubID:%d MonID:%3d NodeName:%-20s:%d]\n",
+				intIMMSN, subId, monId, charMonIDNodeIndex[monId], *(UA_Boolean *)value->value.data);
+	}
+	else if (value->value.type->typeIndex == UA_TYPES_FLOAT)
+	{
+		fprintf(stderr, "[SubscribeIMM]IMMSN:%d IMM Parameter [SubID:%d MonID:%3d NodeName:%-20s:%f]\n",
+				intIMMSN, subId, monId, charMonIDNodeIndex[monId], *(UA_Float *)value->value.data);
+	}
+	else if (value->value.type->typeIndex == UA_TYPES_DOUBLE)
+	{
+		fprintf(stderr, "[SubscribeIMM]IMMSN:%d IMM Parameter [SubID:%d MonID:%3d NodeName:%-20s:%f]\n",
+				intIMMSN, subId, monId, charMonIDNodeIndex[monId], *(UA_Double *)value->value.data);
+	}
+	else if (value->value.type->typeIndex == UA_TYPES_INT16)
+	{
+		fprintf(stderr, "[SubscribeIMM]IMMSN:%d IMM Parameter [SubID:%d MonID:%3d NodeName:%-20s:%d]\n",
+				intIMMSN, subId, monId, charMonIDNodeIndex[monId], *(UA_Int16 *)value->value.data);
+	}
+	else if (value->value.type->typeIndex == UA_TYPES_UINT16)
+	{
+		fprintf(stderr, "[SubscribeIMM]IMMSN:%d IMM Parameter [SubID:%d MonID:%3d NodeName:%-20s:%d]\n",
+				intIMMSN, subId, monId, charMonIDNodeIndex[monId], *(UA_UInt16 *)value->value.data);
+	}
+	else if (value->value.type->typeIndex == UA_TYPES_INT32)
+	{
+		fprintf(stderr, "[SubscribeIMM]IMMSN:%d IMM Parameter [SubID:%d MonID:%3d NodeName:%-20s:%d]\n",
+				intIMMSN, subId, monId, charMonIDNodeIndex[monId], *(UA_Int32 *)value->value.data);
+	}
+	else if (value->value.type->typeIndex == UA_TYPES_UINT32)
+	{
+		fprintf(stderr, "[SubscribeIMM]IMMSN:%d IMM Parameter [SubID:%d MonID:%3d NodeName:%-20s:%d]\n",
+				intIMMSN, subId, monId, charMonIDNodeIndex[monId], *(UA_UInt32 *)value->value.data);
+	}
+	else if (value->value.type->typeIndex == UA_TYPES_INT64)
+	{
+		fprintf(stderr, "[SubscribeIMM]IMMSN:%d IMM Parameter [SubID:%d MonID:%3d NodeName:%-20s:%ld]\n",
+				intIMMSN, subId, monId, charMonIDNodeIndex[monId], *(UA_Int64 *)value->value.data);
+	}
+	else if (value->value.type->typeIndex == UA_TYPES_UINT64)
+	{
+		fprintf(stderr, "[SubscribeIMM]IMMSN:%d IMM Parameter [SubID:%d MonID:%3d NodeName:%-20s:%ld]\n",
+				intIMMSN, subId, monId, charMonIDNodeIndex[monId], *(UA_Int64 *)value->value.data);
+	}
+#endif
+
+	mysql_close(&mysqlCon);
+	return;
+}
+
+int OPCUA_SubscribeIMM(UA_Client *client, MYSQL mysqlCon)
+{
+	char charStatement[MAX_STRING_SIZE];
+	char charErrMsg[LONG_STRING_SIZE];
+	int intRetval;
+	unsigned int intLogSN;
+	//int	intOPCUAVersionSN;
+
+	UA_CreateSubscriptionRequest request = UA_CreateSubscriptionRequest_default();
+	request.requestedPublishingInterval = 1000;
+	//request.requestedPublishingInterval=3;
+	request.requestedMaxKeepAliveCount = 1000;
+	//request.maxNotificationsPerPublish=1;
+	//request.publishingEnabled=false;
+
+	UA_CreateSubscriptionResponse response = UA_Client_Subscriptions_create(client, request, NULL, NULL, NULL);
+	if (response.responseHeader.serviceResult == UA_STATUSCODE_GOOD)
+	{
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+		fprintf(stderr, "[OPCUA_SubscribeIMM]Create subscription succeeded, id %u\n", response.subscriptionId);
+#endif
+	}
+	else
+	{
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+		fprintf(stderr, "[OPCUA_SubscribeIMM]Create subscription failed\n");
+		return EXIT_FAILURE;
+#endif
+	}
+
+	UA_MonitoredItemCreateRequest monRequest;
+	UA_MonitoredItemCreateResult monResponse;
+
+	mysql_init(&mysqlCon);
+	if (!mysql_real_connect(&mysqlCon, MYSQL_SERVER_IP, MYSQL_USER_NAME, MYSQL_PASSWORD, NULL, 0, NULL, CLIENT_FOUND_ROWS))
+	{
+		if (mysql_errno(&mysqlCon))
+			fprintf(stderr, "Fail to connect to MySql server %d: %s\n", mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+		return EXIT_FAILURE;
+	}
+
+	/*
+	snprintf(charStatement,MAX_STRING_SIZE,"SELECT OPCUAVersionSN FROM %s_%s.IMMList WHERE IMMSN=%d",
+	 SYS_NAME,DATA_DATABASE_NAME,intIMMSN);
+	intRetval=mysql_query(&mysqlCon,charStatement);
+	if(intRetval){
+		snprintf(charErrMsg,LONG_STRING_SIZE,"[SubscribeIMM]Fail to select OPCUAVersionSN from table %s_%s.IMMList (%d): %s",
+		 SYS_NAME,DATA_DATABASE_NAME,mysql_errno(&mysqlCon),mysql_error(&mysqlCon));
+		SYS_InsertSysErrMsg(mysqlCon,ERRCLASS_IMM,intMOSN,intIMMSN,mysql_errno(&mysqlCon),charErrMsg);
+		return EXIT_FAILURE;
+	}
+
+	MYSQL_RES *mysqlResult=mysql_store_result(&mysqlCon);
+	MYSQL_ROW mysqlRow=mysql_fetch_row(mysqlResult);
+	mysql_free_result(mysqlResult);
+	intOPCUAVersionSN=atoi(mysqlRow[0]);
+	*/
+
+	//Select Node NameSpace and ID Where OPCUAVersionSN Is Given
+	snprintf(charStatement, MAX_STRING_SIZE,
+			 "SELECT * FROM %s_%s.OPCUAVersionIndex WHERE OPCUAVersionSN=%d", SYS_NAME, INDEX_DATABASE_NAME, intOPCUAVersionSN);
+	intRetval = mysql_query(&mysqlCon, charStatement);
+	if (intRetval)
+	{
+		snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]Fail to select OPCUAVersionSN from table %s_%s.IMMList (%d): %s",
+				 SYS_NAME, DATA_DATABASE_NAME, mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+		intLogSN = SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+		return intLogSN;
+	}
+	MYSQL_RES *mysqlResult = mysql_store_result(&mysqlCon);
+	MYSQL_ROW mysqlRow = mysql_fetch_row(mysqlResult);
+	for (int i = 1; i <= OPCUA_IMMPARA_NODE_NUM; i++)
+	{
+		if (mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_NS] != NULL &&
+			(strcmp(mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_IDENTIFIER_TYPE], "i") == 0 ||
+			 strcmp(mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_IDENTIFIER_TYPE], "s") == 0))
+		{
+			if (strcmp(mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_IDENTIFIER_TYPE], "i") == 0)
+			{
+				monRequest = UA_MonitoredItemCreateRequest_default(UA_NODEID_NUMERIC(
+					atoi(mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_NS]),
+					atoi(mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_ID])));
+			}
+			else
+			{
+				monRequest = UA_MonitoredItemCreateRequest_default(UA_NODEID_STRING(
+					atoi(mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_NS]),
+					mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_ID]));
+			}
+
+			monResponse = UA_Client_MonitoredItems_createDataChange(client, response.subscriptionId,
+																	UA_TIMESTAMPSTORETURN_BOTH, monRequest, NULL, handler_IMMChanged, NULL);
+			fprintf(stderr, "[SubscribeIMM]i=%d IMMSN:%d is trying to monitor %s[%s:%s], id %u\n", i, intIMMSN,
+					mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_NAME],
+					mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_NS],
+					mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_ID], monResponse.monitoredItemId);
+
+			if (monResponse.statusCode == UA_STATUSCODE_GOOD)
+			{
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+				fprintf(stderr, "[SubscribeIMM]IMMSN:%d is monitoring [NS:%2s ID:%-65s Name:%-20s], id %u\n", intIMMSN,
+						mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_NS],
+						mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_ID],
+						mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_NAME], monResponse.monitoredItemId);
+#endif
+				strcpy(charMonIDNodeIndex[monResponse.monitoredItemId], mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_NAME]);
+				intMonIDNodeIndex[monResponse.monitoredItemId] = i;
+			}
+			else
+			{
+				snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]IMMSN:%d fails to monitor [%s:%s], id %u", intIMMSN,
+						 mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_NS],
+						 mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_ID], monResponse.monitoredItemId);
+				SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+			}
+		}
+	}
+	for (int i = OPCUA_IMMPARA_NODE_NUM + 1; i <= OPCUA_IMMSENSOR_NODE_NUM + OPCUA_IMMPARA_NODE_NUM; i++)
+	{
+		strcpy(charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NAME],
+			   mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_NAME]);
+		if (mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_NS] != NULL)
+		{
+			strcpy(charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_IDENTIFIER_TYPE],
+				   mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_IDENTIFIER_TYPE]);
+			strcpy(charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_NS],
+				   mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_NS]);
+			strcpy(charOPCUAIMMSensorNodeList[i - OPCUA_IMMPARA_NODE_NUM - 1][OPCUA_META_ID],
+				   mysqlRow[OPCUA_VERSION_META_NUM + (i - 1) * OPCUA_META_NUM + OPCUA_META_ID]);
+		}
+	}
+	mysql_free_result(mysqlResult);
+
+#ifdef DEBUG_MODE_SUBSCRIBEIMM_CURRENT_TIME
+	monRequest = UA_MonitoredItemCreateRequest_default(UA_NODEID_NUMERIC(0, 2258));
+	monResponse = UA_Client_MonitoredItems_createDataChange(client, response.subscriptionId,
+															UA_TIMESTAMPSTORETURN_BOTH, monRequest, NULL, handler_IMMChanged, NULL);
+	if (monResponse.statusCode == UA_STATUSCODE_GOOD)
+	{
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+		fprintf(stderr, "[SubscribeIMM]IMMSN:%d is monitoring [0:2258], id %u\n", intIMMSN, monResponse.monitoredItemId);
+#endif
+		intMonIDNodeIndex[monResponse.monitoredItemId] = IMMSTATE_CURRENT_TIME;
+	}
+	else
+	{
+		snprintf(charErrMsg, LONG_STRING_SIZE, "[SubscribeIMM]IMMSN:%d fails to monitor [0:2258], id %u",
+				 intIMMSN, monResponse.monitoredItemId);
+		SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+	}
+#endif
+
+	return EXIT_SUCCESS;
+}
+
+static void stateCallback(UA_Client *client, UA_ClientState clientState)
+{
+	MYSQL mysqlCon;
+	int intRetval;
+	char charErrMsg[LONG_STRING_SIZE];
+	char charStatement[MAX_STRING_SIZE];
+
+	//Check Client State
+	switch (clientState)
+	{
+	case UA_CLIENTSTATE_DISCONNECTED:
+	{
+//The client is disconnected
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+		fprintf(stderr, "[stateCallback]IMMSN:%d OPCUA client is disconnected\n", intIMMSN);
+#endif
+	}
+	break;
+	case UA_CLIENTSTATE_SESSION:
+	{
+#ifdef DEBUG_MODE_SUBSCRIBEIMM
+		fprintf(stderr, "[stateCallback]IMMSN:%d A session with the server is open\n", intIMMSN);
+#endif
+
+		//Connect to MYSQL Server
+		mysql_init(&mysqlCon);
+		if (!mysql_real_connect(&mysqlCon, MYSQL_SERVER_IP, MYSQL_USER_NAME, MYSQL_PASSWORD, NULL, 0, NULL, CLIENT_FOUND_ROWS))
+		{
+			fprintf(stderr, "MYSQL connection failed.\n");
+			if (mysql_errno(&mysqlCon))
+			{
+				fprintf(stderr, "MYSQL connection error %d: %s\n", mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+			}
+			return;
+		}
+
+		//Update SubscribeIMMPID and IMMLastUpdateTime to INJPRO_Data.IMMList
+		snprintf(charStatement, MAX_STRING_SIZE,
+				 "UPDATE %s_%s.IMMList SET SubscribeIMMPID=%d,IMMLastUpdateTime=NOW(6) WHERE IMMSN=%d",
+				 SYS_NAME, DATA_DATABASE_NAME, getpid(), intIMMSN);
+		intRetval = mysql_query(&mysqlCon, charStatement);
+		if (intRetval)
+		{
+			snprintf(charErrMsg, LONG_STRING_SIZE,
+					 "Fail to update SubscribeIMMPID and IMMLastUpdateTime for IMMSN=%d (%d):%s",
+					 intIMMSN, mysql_errno(&mysqlCon), mysql_error(&mysqlCon));
+			SYS_InsertSysErrMsg(mysqlCon, ERRCLASS_IMM, intMOSN, intIMMSN, mysql_errno(&mysqlCon), charErrMsg);
+			return;
+		}
+		OPCUA_SubscribeIMM(client, mysqlCon);
+		mysql_close(&mysqlCon);
+	}
+	break;
+	}
+	return;
+}
